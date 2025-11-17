@@ -32,6 +32,7 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 ```
 
 ### Dataset Preparation
+python dataset/build_factorization_dataset.py --train-size 10000 --test-size 2000 --min-bits 2 --max-bits 24 --output-dir data/factorization-test
 
 ```bash
 # ARC-AGI-1

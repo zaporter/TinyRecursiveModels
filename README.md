@@ -27,7 +27,7 @@ Tiny Recursion Model (TRM) recursively improves its predicted answer y with a ti
 pip install --upgrade pip wheel setuptools
 pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126 # install torch based on your cuda version
 pip install -r requirements.txt # install requirements
-pip install --no-cache-dir --no-build-isolation adam-atan2 
+pip install --no-cache-dir --no-build-isolation adam-atan2
 wandb login YOUR-LOGIN # login if you want the logger to sync results to your Weights & Biases (https://wandb.ai/)
 ```
 
@@ -73,7 +73,7 @@ arch.H_cycles=3 arch.L_cycles=4 \
 
 ```
 
-*Runtime:* ~3 days
+_Runtime:_ ~3 days
 
 ### ARC-AGI-2 (assuming 4 H-100 GPUs):
 
@@ -88,7 +88,7 @@ arch.H_cycles=3 arch.L_cycles=4 \
 
 ```
 
-*Runtime:* ~3 days
+_Runtime:_ ~3 days
 
 ### Sudoku-Extreme (assuming 1 L40S GPU):
 
@@ -105,6 +105,17 @@ arch.L_layers=2 \
 arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} ema=True
 
+run_name="pretrain_att_sudoku_multigpu"
+torchrun --nproc-per-node 2 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
+arch=trm \
+data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+evaluators="[]" \
+epochs=5000 eval_interval=500 \
+lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+arch.L_layers=2 \
+arch.H_cycles=3 arch.L_cycles=6 \
++run_name=${run_name} ema=True
+
 run_name="pretrain_att_sudoku"
 python pretrain.py \
 arch=trm \
@@ -117,7 +128,7 @@ arch.H_cycles=3 arch.L_cycles=6 \
 +run_name=${run_name} ema=True
 ```
 
-*Runtime:* < 36 hours
+_Runtime:_ < 36 hours
 
 ### Maze-Hard (assuming 4 L40S GPUs):
 
@@ -134,7 +145,7 @@ arch.H_cycles=3 arch.L_cycles=4 \
 +run_name=${run_name} ema=True
 ```
 
-*Runtime:* < 24 hours
+_Runtime:_ < 24 hours
 
 ## Reference
 
@@ -142,13 +153,13 @@ If you find our work useful, please consider citing:
 
 ```bibtex
 @misc{jolicoeurmartineau2025morerecursivereasoningtiny,
-      title={Less is More: Recursive Reasoning with Tiny Networks}, 
+      title={Less is More: Recursive Reasoning with Tiny Networks},
       author={Alexia Jolicoeur-Martineau},
       year={2025},
       eprint={2510.04871},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2510.04871}, 
+      url={https://arxiv.org/abs/2510.04871},
 }
 ```
 
@@ -156,13 +167,13 @@ and the Hierarchical Reasoning Model (HRM):
 
 ```bibtex
 @misc{wang2025hierarchicalreasoningmodel,
-      title={Hierarchical Reasoning Model}, 
+      title={Hierarchical Reasoning Model},
       author={Guan Wang and Jin Li and Yuhao Sun and Xing Chen and Changling Liu and Yue Wu and Meng Lu and Sen Song and Yasin Abbasi Yadkori},
       year={2025},
       eprint={2506.21734},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2506.21734}, 
+      url={https://arxiv.org/abs/2506.21734},
 }
 ```
 

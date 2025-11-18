@@ -1,7 +1,14 @@
 # Devenv
 .devenv*
 devenv.local.nix
+wandb
+data
+checkpoints
 
+outputs
+out.txt
+**/*.pyc
+__pycache__
 # direnv
 .direnv
 

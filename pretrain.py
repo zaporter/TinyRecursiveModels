@@ -20,7 +20,7 @@ from omegaconf import DictConfig
 from adam_atan2_pytorch import AdamAtan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
-from utils.functions import load_model_class, get_model_source_path
+from utils.functions import load_model_class, get_model_source_path, load_callable
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
@@ -39,6 +39,20 @@ class ArchConfig(pydantic.BaseModel):
 class EvaluatorConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="allow")
     name: str
+
+
+class DatasetGeneratorConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: str
+    output_root: str
+    initial_max_bits: Optional[int] = None
+    bits_increment: int = 1
+    regen_interval: int = 10000
+    samples_per_bit: int = 1000
+    min_bits: Optional[int] = None
+    test_samples_per_bit: int = 0
+    refresh_test_split: bool = True
+    seed_offset: int = 0
 
 
 class PretrainConfig(pydantic.BaseModel):
@@ -82,6 +96,7 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    dataset_generator: Optional[DatasetGeneratorConfig] = None
 
 @dataclass
 class TrainState:
@@ -93,6 +108,97 @@ class TrainState:
     step: int
     total_steps: int
 
+
+class DynamicDatasetManager:
+    def __init__(self, config: PretrainConfig, rank: int, world_size: int):
+        self.config = config
+        self.rank = rank
+        self.world_size = world_size
+        self.dataset_cfg = config.dataset_generator
+        self.generator_fn = None
+        if self.dataset_cfg is not None:
+            self.generator_fn = load_callable(self.dataset_cfg.name)
+        self.current_stage: Optional[int] = None
+
+    def enabled(self) -> bool:
+        return self.generator_fn is not None and self.dataset_cfg is not None
+
+    def ensure_stage(self, stage_idx: int):
+        if not self.enabled():
+            return False
+        if self.current_stage == stage_idx:
+            return False
+        stage_info = self._generate_stage(stage_idx)
+        self.current_stage = stage_idx
+        return stage_info
+
+    def _generate_stage(self, stage_idx: int):
+        assert self.dataset_cfg is not None and self.generator_fn is not None
+        cfg = self.dataset_cfg
+
+        start_bits = cfg.initial_max_bits
+        if start_bits is None:
+            if cfg.min_bits is not None:
+                start_bits = cfg.min_bits
+            else:
+                raise ValueError("dataset_generator requires either initial_max_bits or min_bits to be set.")
+
+        max_bits = start_bits + stage_idx * cfg.bits_increment
+        train_size = max_bits * max(1, cfg.samples_per_bit)
+        test_size = max_bits * cfg.test_samples_per_bit if cfg.test_samples_per_bit > 0 else 0
+        output_dir = os.path.join(cfg.output_root, f"stage_{stage_idx:04d}_bits_{max_bits}")
+        min_bits = cfg.min_bits if cfg.min_bits is not None else max_bits
+        min_bits = min(min_bits, max_bits)
+        extra_kwargs = dict(cfg.__pydantic_extra__ or {})
+        generator_kwargs = {
+            **extra_kwargs,
+            "output_dir": output_dir,
+            "max_bits": max_bits,
+            "min_bits": min_bits,
+            "train_size": train_size,
+            "test_size": test_size,
+            "seed": self.config.seed + cfg.seed_offset + stage_idx,
+        }
+
+        if self.rank == 0:
+            print(f"[DynamicDataset] Stage {stage_idx}: max_bits={max_bits}, train_examples={train_size}")
+            os.makedirs(output_dir, exist_ok=True)
+            self.generator_fn(**generator_kwargs)
+
+        if self.world_size > 1 and dist.is_initialized():
+            dist.barrier()
+
+        self.config.data_paths = [output_dir]
+        if not self.config.data_paths_test or cfg.refresh_test_split:
+            if test_size > 0:
+                self.config.data_paths_test = [output_dir]
+            elif cfg.refresh_test_split:
+                self.config.data_paths_test = []
+
+        return {
+            "stage": stage_idx,
+            "output_dir": output_dir,
+            "max_bits": max_bits,
+            "min_bits": min_bits,
+            "train_size": train_size,
+            "test_size": test_size,
+        }
+
+
+def log_dataset_stage_to_wandb(stage_info: Optional[dict], step: int):
+    if stage_info is None or wandb.run is None:
+        return
+
+    wandb.log(
+        {
+            "dataset/stage": stage_info.get("stage"),
+            "dataset/max_bits": stage_info.get("max_bits"),
+            "dataset/min_bits": stage_info.get("min_bits"),
+            "dataset/train_examples": stage_info.get("train_size"),
+            "dataset/test_examples": stage_info.get("test_size"),
+        },
+        step=step,
+    )
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     dataset = PuzzleDataset(PuzzleDatasetConfig(
@@ -285,6 +391,34 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
             evaluators.append(cls)
 
     return evaluators
+
+
+def build_eval_components(config: PretrainConfig, rank: int, world_size: int):
+    eval_loader = None
+    eval_metadata = None
+    try:
+        eval_loader, eval_metadata = create_dataloader(
+            config,
+            "test",
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=rank,
+            world_size=world_size,
+        )
+    except Exception:
+        print("NO EVAL DATA FOUND")
+        eval_loader = eval_metadata = None
+
+    evaluators: List[Any] = []
+    if eval_metadata is not None:
+        try:
+            evaluators = create_evaluators(config, eval_metadata)
+        except Exception:
+            print("No evaluator found")
+            evaluators = []
+
+    return eval_loader, eval_metadata, evaluators
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
@@ -566,18 +700,29 @@ def launch(hydra_config: DictConfig):
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    try:
-        eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except:
-        print("NO EVAL DATA FOUND")
-        eval_loader = eval_metadata = None
+    dataset_manager = DynamicDatasetManager(config, rank=RANK, world_size=WORLD_SIZE)
+    iters_per_stage = total_iters
+    pending_stage_info = None
+    if dataset_manager.enabled():
+        regen_interval = config.dataset_generator.regen_interval  # type: ignore[union-attr]
+        assert regen_interval % train_epochs_per_iter == 0, "Dataset regen interval must align with eval interval."
+        iters_per_stage = max(1, regen_interval // train_epochs_per_iter)
+        pending_stage_info = dataset_manager.ensure_stage(0)
 
-    try:
-        evaluators = create_evaluators(config, eval_metadata)
-    except:
-        print("No evaluator found")
-        evaluators = []
+    train_loader, train_metadata = create_dataloader(
+        config,
+        "train",
+        test_set_mode=False,
+        epochs_per_iter=train_epochs_per_iter,
+        global_batch_size=config.global_batch_size,
+        rank=RANK,
+        world_size=WORLD_SIZE,
+    )
+    eval_loader, eval_metadata, evaluators = build_eval_components(config, rank=RANK, world_size=WORLD_SIZE)
+    current_stage_idx = dataset_manager.current_stage if dataset_manager.enabled() else 0
+    if current_stage_idx is None:
+        current_stage_idx = 0
+    current_stage_info = pending_stage_info
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
@@ -590,6 +735,7 @@ def launch(hydra_config: DictConfig):
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
+        log_dataset_stage_to_wandb(current_stage_info, train_state.step)
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
@@ -597,6 +743,28 @@ def launch(hydra_config: DictConfig):
 
     # Training Loop
     for _iter_id in range(total_iters):
+        if dataset_manager.enabled():
+            stage_idx = _iter_id // iters_per_stage
+            if stage_idx != current_stage_idx:
+                new_stage_info = dataset_manager.ensure_stage(stage_idx)
+                if new_stage_info:
+                    current_stage_info = new_stage_info
+                    if RANK == 0:
+                        log_dataset_stage_to_wandb(current_stage_info, train_state.step)
+                train_loader, _ = create_dataloader(
+                    config,
+                    "train",
+                    test_set_mode=False,
+                    epochs_per_iter=train_epochs_per_iter,
+                    global_batch_size=config.global_batch_size,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                )
+                eval_loader, eval_metadata, evaluators = build_eval_components(
+                    config, rank=RANK, world_size=WORLD_SIZE
+                )
+                current_stage_idx = stage_idx
+
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
@@ -612,7 +780,11 @@ def launch(hydra_config: DictConfig):
             if config.ema:
                 ema_helper.update(train_state.model)
 
-        if _iter_id >= config.min_eval_interval:
+        if (
+            eval_loader is not None
+            and eval_metadata is not None
+            and _iter_id >= config.min_eval_interval
+        ):
             ############ Evaluation
             if RANK == 0:
                 print("EVALUATE")

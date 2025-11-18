@@ -9,7 +9,10 @@ from pydantic import BaseModel
 from tqdm import tqdm
 from sympy import randprime, isprime
 
-from common import PuzzleDatasetMetadata
+try:
+    from dataset.common import PuzzleDatasetMetadata
+except ModuleNotFoundError:  # Backwards compat when running as a script
+    from common import PuzzleDatasetMetadata  # type: ignore
 
 
 cli = ArgParser()
@@ -188,6 +191,60 @@ def convert_subset(set_name: str, config: DataProcessConfig, num_samples: int, s
     print(f"  - Total examples: {len(results['inputs'])}")
     print(f"  - Input shape: {results['inputs'].shape}")
     print(f"  - Label shape: {results['labels'].shape}")
+
+
+def generate_factorization_dataset(
+    *,
+    output_dir: str,
+    train_size: int,
+    test_size: int = 0,
+    min_bits: Optional[int] = None,
+    max_bits: int,
+    max_seq_len: Optional[int] = None,
+    seed: int = 42,
+    test_seed_offset: int = 1_000_000,
+) -> str:
+    """
+    Programmatic helper to (re)generate the factorization dataset.
+
+    Args:
+        output_dir: Directory that will contain `train/` and `test/` subsets.
+        train_size: Number of training examples to create.
+        test_size: Number of test examples to create. Set to 0 to skip.
+        min_bits: Minimum bit-width for primes. Defaults to `max_bits`.
+        max_bits: Maximum bit-width for primes.
+        max_seq_len: Sequence length used for binary encodings.
+        seed: Base RNG seed for the training split.
+        test_seed_offset: Offset added to the seed for the test split to avoid overlap.
+
+    Returns:
+        The `output_dir` containing the generated dataset.
+    """
+    if max_seq_len is None:
+        max_seq_len = DataProcessConfig.model_fields["max_seq_len"].default  # type: ignore[index]
+    min_bits = min_bits if min_bits is not None else max_bits
+
+    if min_bits > max_bits:
+        raise ValueError(
+            f"min_bits ({min_bits}) must be <= max_bits ({max_bits}). "
+            "Please adjust the dataset_generator settings."
+        )
+
+    config = DataProcessConfig(
+        output_dir=output_dir,
+        train_size=train_size,
+        test_size=max(0, test_size),
+        min_bits=min_bits,
+        max_bits=max_bits,
+        max_seq_len=max_seq_len,
+        seed=seed,
+    )
+
+    convert_subset("train", config, num_samples=config.train_size, seed_offset=0)
+    if config.test_size > 0:
+        convert_subset("test", config, num_samples=config.test_size, seed_offset=test_seed_offset)
+
+    return output_dir
 
 
 @cli.command(singleton=True)

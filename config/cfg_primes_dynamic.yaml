@@ -1,0 +1,51 @@
+defaults:
+  - arch: trm
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Placeholder; replaced automatically by DynamicDatasetManager after stage 0 generation
+data_paths: ['data/factorization-dynamic/bootstrap']
+data_paths_test: []
+
+evaluators: []
+
+global_batch_size: 768
+
+epochs: 50000
+eval_interval: 500
+checkpoint_every_eval: true
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_weight_decay: 1.0
+
+puzzle_emb_lr: 1e-4
+
+seed: 0
+min_eval_interval: 0
+
+ema: true
+ema_rate: 0.999
+freeze_weights: false
+
+run_name: primes-dynamic
+
+dataset_generator:
+  name: dataset.build_factorization_dataset@generate_factorization_dataset
+  output_root: data/factorization-dynamic
+  bits_increment: 1
+  regen_interval: 5000
+  samples_per_bit: 400
+  min_bits: 9
+  test_samples_per_bit: 400
+  refresh_test_split: true
+  seed_offset: 0
+  max_seq_len: 64
+

@@ -34,6 +34,9 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 ### Dataset Preparation
 python dataset/build_factorization_dataset.py --train-size 10000 --test-size 2000 --min-bits 2 --max-bits 24 --output-dir data/factorization-test
 
+torchrun --nproc-per-node 8 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 pretrain.py \
+  --config-name cfg_primes_dynamic \
+  run_name=primes-dynamic
 ```bash
 # ARC-AGI-1
 python -m dataset.build_arc_dataset \

@@ -1,4 +1,3 @@
-
 {
   pkgs,
   lib,
@@ -29,8 +28,6 @@
   # https://devenv.sh/languages/
   languages.go.enable = true;
   languages.python.enable = true;
-  languages.python.uv.enable = true;
-  languages.python.uv.sync.enable = true;
 
   # https://devenv.sh/processes/
   # processes.cargo-watch.exec = "cargo-watch";

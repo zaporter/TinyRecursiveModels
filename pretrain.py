@@ -872,6 +872,7 @@ def launch(hydra_config: DictConfig):
                 if metric_value is None:
                     metric_value = get_nested_metric(train_metrics, config.stage_advance_metric)
                 if metric_value is not None:
+                    print(f"Metric value for {config.stage_advance_metric}: {metric_value}")
                     comparison = (config.stage_advance_comparison or "lt").lower()
                     if comparison == "lt":
                         advance_stage = metric_value < config.stage_advance_threshold

@@ -61,39 +61,36 @@ class ACTLossHead(nn.Module):
         if labels.ndim == 2:
             labels = labels.unsqueeze(1)
 
-        if labels.shape[1] != 2:
-            raise ValueError(f"Factorization loss expects exactly 2 targets, got {labels.shape[1]}")
-
-        batch_size, _, seq_len = labels.shape
+        batch_size, num_targets, seq_len = labels.shape
         logits = outputs["logits"]
         preds = torch.argmax(logits, dim=-1)
         outputs["preds"] = preds
 
+        # Expand logits to match targets for computing per-target losses
+        logits_expanded = logits.unsqueeze(1).expand(-1, num_targets, -1, -1)
+        logits_flat = logits_expanded.reshape(batch_size * num_targets, seq_len, logits.shape[-1])
+        labels_flat = labels.reshape(batch_size * num_targets, seq_len)
         mask = (labels != IGNORE_LABEL_ID)
-        per_target_losses = []
-        for target_idx in range(2):
-            per_target_losses.append(
-                self.loss_fn(
-                    logits,
-                    labels[:, target_idx],
-                    ignore_index=IGNORE_LABEL_ID,
-                    valid_mask=mask[:, target_idx],
-                )
-            )
-        per_token_loss = torch.stack(per_target_losses, dim=1)
+        mask_flat = mask.reshape(batch_size * num_targets, seq_len)
+
+        per_token_loss = self.loss_fn(
+            logits_flat,
+            labels_flat,
+            ignore_index=IGNORE_LABEL_ID,
+            valid_mask=mask_flat,
+        ).reshape(batch_size, num_targets, seq_len)
 
         loss_counts = mask.sum(-1)
         loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1).to(per_token_loss.dtype)
         per_target_mean_loss = (per_token_loss / loss_divisor).sum(-1)
+        best_loss_values, best_target_idx = per_target_mean_loss.min(dim=1)
+        lm_loss = best_loss_values.sum()
 
-        # Soft-min across the two targets for smoother gradients
-        lm_loss = (-torch.logsumexp(-per_target_mean_loss, dim=1)).sum()
-        best_target_idx = per_target_mean_loss.argmin(dim=1)
-
-        gather_idx = best_target_idx.view(batch_size, 1, 1).expand(-1, 1, seq_len)
-        best_labels = torch.gather(labels, dim=1, index=gather_idx).squeeze(1)
-        best_masks = torch.gather(mask.to(best_labels.dtype), dim=1, index=gather_idx).squeeze(1).to(torch.bool)
-        best_loss_counts = torch.gather(loss_counts, dim=1, index=best_target_idx.view(-1, 1)).squeeze(1)
+        target_offsets = torch.arange(batch_size, device=labels.device, dtype=best_target_idx.dtype) * max(num_targets, 1)
+        best_flat_indices = target_offsets + best_target_idx
+        best_labels = labels_flat.index_select(0, best_flat_indices)
+        best_masks = mask_flat.index_select(0, best_flat_indices)
+        best_loss_counts = loss_counts.reshape(batch_size * num_targets).index_select(0, best_flat_indices)
         best_loss_divisor = best_loss_counts.clamp_min(1).unsqueeze(-1).to(torch.float32)
 
         with torch.no_grad():

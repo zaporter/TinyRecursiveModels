@@ -71,6 +71,7 @@ class PretrainConfig(pydantic.BaseModel):
     lr: float
     lr_min_ratio: float
     lr_warmup_steps: int
+    lr_num_cycles: float = 0.5
 
     weight_decay: float
     beta1: float
@@ -110,6 +111,8 @@ class TrainState:
 
     step: int
     total_steps: int
+    stage_step: int
+    stage_max_steps: int
 
 
 class DynamicDatasetManager:
@@ -365,6 +368,8 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     return TrainState(
         step=0,
         total_steps=total_steps,
+        stage_step=0,
+        stage_max_steps=max(1, total_steps),
 
         model=model,
         optimizers=optimizers,
@@ -405,12 +410,29 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     return cosine_schedule_with_warmup_lr_lambda(
-        current_step=train_state.step,
+        current_step=train_state.stage_step,
         base_lr=base_lr,
         num_warmup_steps=round(config.lr_warmup_steps),
-        num_training_steps=train_state.total_steps,
-        min_ratio=config.lr_min_ratio
+        num_training_steps=max(1, train_state.stage_max_steps),
+        min_ratio=config.lr_min_ratio,
+        num_cycles=config.lr_num_cycles,
     )
+
+
+def _estimate_stage_max_steps(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int) -> int:
+    steps_per_epoch = math.ceil(
+        (train_metadata.total_groups * train_metadata.mean_puzzle_examples) / max(1, config.global_batch_size)
+    )
+    steps_per_epoch = max(1, steps_per_epoch)
+    epochs_per_iter = max(1, epochs_per_iter)
+    return max(1, steps_per_epoch * epochs_per_iter)
+
+
+def reset_stage_scheduler(
+    train_state: TrainState, config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int
+):
+    train_state.stage_step = 0
+    train_state.stage_max_steps = _estimate_stage_max_steps(config, train_metadata, epochs_per_iter)
 
 
 
@@ -457,6 +479,7 @@ def build_eval_components(config: PretrainConfig, rank: int, world_size: int):
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
+    train_state.stage_step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
@@ -770,6 +793,8 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    if dataset_manager.enabled():
+        reset_stage_scheduler(train_state, config, train_metadata, train_epochs_per_iter)
 
     # Progress bar and logger
     progress_bar = None
@@ -795,7 +820,7 @@ def launch(hydra_config: DictConfig):
                     current_stage_info = new_stage_info
                     if RANK == 0:
                         log_dataset_stage_to_wandb(current_stage_info, train_state.step)
-                train_loader, _ = create_dataloader(
+                train_loader, train_metadata = create_dataloader(
                     config,
                     "train",
                     test_set_mode=False,
@@ -804,6 +829,7 @@ def launch(hydra_config: DictConfig):
                     rank=RANK,
                     world_size=WORLD_SIZE,
                 )
+                reset_stage_scheduler(train_state, config, train_metadata, train_epochs_per_iter)
                 eval_loader, eval_metadata, evaluators = build_eval_components(
                     config, rank=RANK, world_size=WORLD_SIZE
                 )
@@ -900,7 +926,7 @@ def launch(hydra_config: DictConfig):
                     current_stage_info = new_stage_info
                     if RANK == 0:
                         log_dataset_stage_to_wandb(current_stage_info, train_state.step)
-                train_loader, _ = create_dataloader(
+                train_loader, train_metadata = create_dataloader(
                     config,
                     "train",
                     test_set_mode=False,
@@ -909,6 +935,7 @@ def launch(hydra_config: DictConfig):
                     rank=RANK,
                     world_size=WORLD_SIZE,
                 )
+                reset_stage_scheduler(train_state, config, train_metadata, train_epochs_per_iter)
                 eval_loader, eval_metadata, evaluators = build_eval_components(
                     config, rank=RANK, world_size=WORLD_SIZE
                 )

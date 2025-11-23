@@ -13,22 +13,23 @@ evaluators: []
 
 global_batch_size: 768
 
-epochs: 50000
+epochs: 500000
 eval_interval: 500
 checkpoint_every_eval: true
 stage_advance_metric: 'train/lm_loss'
 stage_advance_threshold: 0.1
 
-lr: 1e-4
-lr_min_ratio: 1.0
+lr: 3e-5
+lr_min_ratio: 0.1
 lr_warmup_steps: 2000
+lr_num_cycles: 3.0
 
 beta1: 0.9
 beta2: 0.95
 weight_decay: 1.0
 puzzle_emb_weight_decay: 1.0
 
-puzzle_emb_lr: 1e-4
+puzzle_emb_lr: 5e-5
 
 seed: 0
 min_eval_interval: 0

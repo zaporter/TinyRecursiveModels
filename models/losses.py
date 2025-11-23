@@ -58,33 +58,62 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
+        if labels.ndim == 2:
+            labels = labels.unsqueeze(1)
+
+        if labels.shape[1] != 2:
+            raise ValueError(f"Factorization loss expects exactly 2 targets, got {labels.shape[1]}")
+
+        batch_size, _, seq_len = labels.shape
+        logits = outputs["logits"]
+        preds = torch.argmax(logits, dim=-1)
+        outputs["preds"] = preds
+
+        mask = (labels != IGNORE_LABEL_ID)
+        per_target_losses = []
+        for target_idx in range(2):
+            per_target_losses.append(
+                self.loss_fn(
+                    logits,
+                    labels[:, target_idx],
+                    ignore_index=IGNORE_LABEL_ID,
+                    valid_mask=mask[:, target_idx],
+                )
+            )
+        per_token_loss = torch.stack(per_target_losses, dim=1)
+
+        loss_counts = mask.sum(-1)
+        loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1).to(per_token_loss.dtype)
+        per_target_mean_loss = (per_token_loss / loss_divisor).sum(-1)
+
+        # Soft-min across the two targets for smoother gradients
+        lm_loss = (-torch.logsumexp(-per_target_mean_loss, dim=1)).sum()
+        best_target_idx = per_target_mean_loss.argmin(dim=1)
+
+        gather_idx = best_target_idx.view(batch_size, 1, 1).expand(-1, 1, seq_len)
+        best_labels = torch.gather(labels, dim=1, index=gather_idx).squeeze(1)
+        best_masks = torch.gather(mask.to(best_labels.dtype), dim=1, index=gather_idx).squeeze(1).to(torch.bool)
+        best_loss_counts = torch.gather(loss_counts, dim=1, index=best_target_idx.view(-1, 1)).squeeze(1)
+        best_loss_divisor = best_loss_counts.clamp_min(1).unsqueeze(-1).to(torch.float32)
+
         with torch.no_grad():
-            # Preds
-            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+            is_correct = best_masks & (preds == best_labels)
+            seq_is_correct = is_correct.sum(-1) == best_loss_counts
 
-            # Correctness
-            mask = (labels != IGNORE_LABEL_ID)
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
-
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
-            
-            # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_metrics = new_carry.halted & (best_loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                "accuracy": torch.where(
+                    valid_metrics,
+                    (is_correct.to(torch.float32) / best_loss_divisor).sum(-1),
+                    0,
+                ).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
         # Losses
-
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),

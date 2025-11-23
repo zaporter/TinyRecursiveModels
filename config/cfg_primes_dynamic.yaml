@@ -16,6 +16,8 @@ global_batch_size: 768
 epochs: 50000
 eval_interval: 500
 checkpoint_every_eval: true
+stage_advance_metric: 'train/lm_loss'
+stage_advance_threshold: -0.55
 
 lr: 1e-4
 lr_min_ratio: 1.0
@@ -41,10 +43,10 @@ dataset_generator:
   name: dataset.build_factorization_dataset@generate_factorization_dataset
   output_root: data/factorization-dynamic
   bits_increment: 1
-  regen_interval: 5000
-  samples_per_bit: 400
+  regen_interval: null
+  samples_per_bit: 800
   min_bits: 9
-  test_samples_per_bit: 400
+  test_samples_per_bit: 600
   refresh_test_split: true
   seed_offset: 0
   max_seq_len: 64

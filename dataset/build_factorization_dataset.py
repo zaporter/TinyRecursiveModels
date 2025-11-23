@@ -84,7 +84,7 @@ def generate_semiprimes(num_samples: int, min_bits: int, max_bits: int, seed: in
         seed: Random seed for reproducibility
     
     Returns:
-        List of (semiprime, smaller_factor) tuples
+        List of tuples where each element is (semiprime, (prime_factor_1, prime_factor_2))
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -100,10 +100,8 @@ def generate_semiprimes(num_samples: int, min_bits: int, max_bits: int, seed: in
         # Calculate the semiprime
         semiprime = p1 * p2
         
-        # The smaller factor is the output
-        smaller_factor = min(p1, p2)
-        
-        semiprimes.append((semiprime, smaller_factor))
+        # Store both prime factors
+        semiprimes.append((semiprime, (p1, p2)))
     
     return semiprimes
 
@@ -128,10 +126,15 @@ def convert_subset(set_name: str, config: DataProcessConfig, num_samples: int, s
     results["group_indices"].append(0)
     
     print(f"Converting {num_samples} examples to dataset format...")
-    for semiprime, smaller_factor in tqdm(semiprimes):
+    for semiprime, prime_pair in tqdm(semiprimes):
         # Convert to binary sequences
         input_seq = number_to_binary_sequence(semiprime, seq_len=config.max_seq_len)
-        label_seq = number_to_binary_sequence(smaller_factor, seq_len=config.max_seq_len)
+        sorted_pair = tuple(sorted(prime_pair))
+        factor_seqs = [
+            number_to_binary_sequence(sorted_pair[0], seq_len=config.max_seq_len),
+            number_to_binary_sequence(sorted_pair[1], seq_len=config.max_seq_len),
+        ]
+        label_seq = np.stack(factor_seqs, axis=0)
         
         results["inputs"].append(input_seq)
         results["labels"].append(label_seq)

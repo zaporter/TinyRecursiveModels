@@ -47,7 +47,7 @@ class DatasetGeneratorConfig(pydantic.BaseModel):
     output_root: str
     initial_max_bits: Optional[int] = None
     bits_increment: int = 1
-    regen_interval: int = 10000
+    regen_interval: Optional[int] = 10000
     samples_per_bit: int = 1000
     min_bits: Optional[int] = None
     test_samples_per_bit: int = 0
@@ -97,6 +97,9 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
     dataset_generator: Optional[DatasetGeneratorConfig] = None
+    stage_advance_metric: Optional[str] = None
+    stage_advance_threshold: Optional[float] = None
+    stage_advance_comparison: str = "lt"
 
 @dataclass
 class TrainState:
@@ -199,6 +202,38 @@ def log_dataset_stage_to_wandb(stage_info: Optional[dict], step: int):
         },
         step=step,
     )
+
+
+def _split_metric_path(metric_path: str) -> List[str]:
+    if "." in metric_path:
+        return [segment for segment in metric_path.split(".") if segment]
+    return [metric_path] if metric_path else []
+
+
+def get_nested_metric(metrics: Any, metric_path: str) -> Optional[float]:
+    """
+    Retrieve a nested metric value given a '/' or '.' separated path, e.g. 'test/loss' or 'test.loss'.
+    Returns None if any key is missing or if the value cannot be cast to float.
+    """
+    if metrics is None:
+        return None
+
+    path_segments = _split_metric_path(metric_path)
+    if not path_segments:
+        return None
+
+    value: Any = metrics
+    for key in path_segments:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+        if value is None:
+            return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     dataset = PuzzleDataset(PuzzleDatasetConfig(
@@ -703,11 +738,20 @@ def launch(hydra_config: DictConfig):
     dataset_manager = DynamicDatasetManager(config, rank=RANK, world_size=WORLD_SIZE)
     iters_per_stage = total_iters
     pending_stage_info = None
+    metric_driven_stage = False
     if dataset_manager.enabled():
-        regen_interval = config.dataset_generator.regen_interval  # type: ignore[union-attr]
-        assert regen_interval % train_epochs_per_iter == 0, "Dataset regen interval must align with eval interval."
-        iters_per_stage = max(1, regen_interval // train_epochs_per_iter)
         pending_stage_info = dataset_manager.ensure_stage(0)
+        metric_driven_stage = (
+            config.stage_advance_metric is not None and config.stage_advance_threshold is not None
+        )
+        if not metric_driven_stage:
+            regen_interval = config.dataset_generator.regen_interval  # type: ignore[union-attr]
+            if regen_interval is None:
+                raise ValueError(
+                    "dataset_generator.regen_interval must be set when metric-driven stage advancement is disabled."
+                )
+            assert regen_interval % train_epochs_per_iter == 0, "Dataset regen interval must align with eval interval."
+            iters_per_stage = max(1, regen_interval // train_epochs_per_iter)
 
     train_loader, train_metadata = create_dataloader(
         config,
@@ -743,7 +787,7 @@ def launch(hydra_config: DictConfig):
 
     # Training Loop
     for _iter_id in range(total_iters):
-        if dataset_manager.enabled():
+        if dataset_manager.enabled() and not metric_driven_stage:
             stage_idx = _iter_id // iters_per_stage
             if stage_idx != current_stage_idx:
                 new_stage_info = dataset_manager.ensure_stage(stage_idx)
@@ -771,8 +815,10 @@ def launch(hydra_config: DictConfig):
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
+        train_metrics = None
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            train_metrics = metrics
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
@@ -812,6 +858,60 @@ def launch(hydra_config: DictConfig):
                 print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
                 save_train_state(config, train_state_eval)
+
+            advance_stage = False
+            if (
+                dataset_manager.enabled()
+                and metric_driven_stage
+                and RANK == 0
+                and metrics is not None
+                and config.stage_advance_metric is not None
+                and config.stage_advance_threshold is not None
+            ):
+                metric_value = get_nested_metric(metrics, config.stage_advance_metric)
+                if metric_value is None:
+                    metric_value = get_nested_metric(train_metrics, config.stage_advance_metric)
+                if metric_value is not None:
+                    comparison = (config.stage_advance_comparison or "lt").lower()
+                    if comparison == "lt":
+                        advance_stage = metric_value < config.stage_advance_threshold
+                    elif comparison == "gt":
+                        advance_stage = metric_value > config.stage_advance_threshold
+                    else:
+                        raise ValueError(f"Unsupported stage_advance_comparison: {comparison}")
+                else:
+                    raise ValueError(f"Metric value for {config.stage_advance_metric} is None. Eval metrics: {metrics}, train_metrics: {train_metrics}")
+
+            if (
+                dataset_manager.enabled()
+                and metric_driven_stage
+                and WORLD_SIZE > 1
+                and dist.is_initialized()
+            ):
+                sync_buf = [advance_stage]
+                dist.broadcast_object_list(sync_buf, src=0)
+                advance_stage = sync_buf[0]
+
+            if dataset_manager.enabled() and metric_driven_stage and advance_stage:
+                stage_idx = current_stage_idx + 1
+                new_stage_info = dataset_manager.ensure_stage(stage_idx)
+                if new_stage_info:
+                    current_stage_info = new_stage_info
+                    if RANK == 0:
+                        log_dataset_stage_to_wandb(current_stage_info, train_state.step)
+                train_loader, _ = create_dataloader(
+                    config,
+                    "train",
+                    test_set_mode=False,
+                    epochs_per_iter=train_epochs_per_iter,
+                    global_batch_size=config.global_batch_size,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                )
+                eval_loader, eval_metadata, evaluators = build_eval_components(
+                    config, rank=RANK, world_size=WORLD_SIZE
+                )
+                current_stage_idx = stage_idx
 
             if config.ema:
                 del train_state_eval

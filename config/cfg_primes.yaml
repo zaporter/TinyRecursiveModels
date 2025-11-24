@@ -20,6 +20,15 @@ lr: 1e-4
 lr_min_ratio: 0.1
 lr_warmup_steps: 1000
 lr_num_cycles: 3.0
+lr_scheduler:
+  name: reduce_on_plateau
+  metric: train/lm_loss
+  mode: min
+  factor: 0.5
+  patience: 4
+  threshold: 1e-3
+  cooldown: 2
+  min_lr: 1e-6
 
 beta1: 0.9
 beta2: 0.95

@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Literal
 from dataclasses import dataclass
 import os
 import math
@@ -55,6 +55,20 @@ class DatasetGeneratorConfig(pydantic.BaseModel):
     seed_offset: int = 0
 
 
+class LRSchedulerConfig(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    name: Literal["reduce_on_plateau"]
+    metric: str
+    mode: Literal["min", "max"] = "min"
+    factor: float = 0.5
+    patience: int = 5
+    threshold: float = 1e-4
+    threshold_mode: Literal["rel", "abs"] = "rel"
+    cooldown: int = 0
+    min_lr: float = 0.0
+    eps: float = 1e-8
+
+
 class PretrainConfig(pydantic.BaseModel):
     # Config
     arch: ArchConfig
@@ -69,9 +83,10 @@ class PretrainConfig(pydantic.BaseModel):
     epochs: int
 
     lr: float
-    lr_min_ratio: float
-    lr_warmup_steps: int
+    lr_warmup_steps: int = 0
+    lr_min_ratio: float = 0.0
     lr_num_cycles: float = 0.5
+    lr_scheduler: Optional[LRSchedulerConfig] = None
 
     weight_decay: float
     beta1: float
@@ -106,13 +121,21 @@ class PretrainConfig(pydantic.BaseModel):
 class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
-    optimizer_lrs: Sequence[float]
+    optimizer_lrs: List[float]
+    lr_schedulers: Sequence[Any]
     carry: Any
 
     step: int
     total_steps: int
     stage_step: int
     stage_max_steps: int
+
+
+@dataclass
+class PlateauSchedulerState:
+    best: Optional[float] = None
+    num_bad_epochs: int = 0
+    cooldown_counter: int = 0
 
 
 class DynamicDatasetManager:
@@ -348,14 +371,124 @@ def mix_weights_direct(device, alpha, net, nets):
     net.load_state_dict(sd_alpha)
     return net
 
-def cosine_schedule_with_warmup_lr_lambda(
-    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
+def create_lr_schedulers(config: PretrainConfig, optimizers: Sequence[torch.optim.Optimizer]) -> Sequence[Any]:
+    scheduler_cfg = config.lr_scheduler
+    if scheduler_cfg is None:
+        return []
+
+    if scheduler_cfg.name == "reduce_on_plateau":
+        return [PlateauSchedulerState() for _ in optimizers]
+
+    raise ValueError(f"Unsupported lr_scheduler: {scheduler_cfg.name}")
+
+
+def step_lr_schedulers(
+    config: PretrainConfig,
+    train_state: TrainState,
+    eval_metrics: Optional[Any],
+    train_metrics: Optional[Any],
 ):
-    if current_step < num_warmup_steps:
+    scheduler_cfg = config.lr_scheduler
+    if scheduler_cfg is None or not len(train_state.lr_schedulers):
+        return
+
+    metric_value = get_nested_metric(eval_metrics, scheduler_cfg.metric)
+    if metric_value is None:
+        metric_value = get_nested_metric(train_metrics, scheduler_cfg.metric)
+
+    if metric_value is None:
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            print(f"[LR Scheduler] Metric '{scheduler_cfg.metric}' not found in eval/train metrics; skipping scheduler step.")
+        return
+
+    def is_better(val: float, best: Optional[float]) -> bool:
+        if best is None:
+            return True
+
+        threshold = scheduler_cfg.threshold
+        if scheduler_cfg.threshold_mode == "rel":
+            threshold = abs(best) * scheduler_cfg.threshold
+
+        if scheduler_cfg.mode == "min":
+            return val < (best - threshold)
+        return val > (best + threshold)
+
+    for idx, state in enumerate(train_state.lr_schedulers):
+        if state.cooldown_counter > 0:
+            state.cooldown_counter -= 1
+            state.num_bad_epochs = 0
+
+        if is_better(metric_value, state.best):
+            state.best = metric_value
+            state.num_bad_epochs = 0
+            continue
+
+        state.num_bad_epochs += 1
+        if state.num_bad_epochs <= scheduler_cfg.patience:
+            continue
+
+        new_lr = max(scheduler_cfg.min_lr, train_state.optimizer_lrs[idx] * scheduler_cfg.factor)
+        if (train_state.optimizer_lrs[idx] - new_lr) <= scheduler_cfg.eps:
+            state.num_bad_epochs = 0
+            continue
+
+        train_state.optimizer_lrs[idx] = new_lr
+        state.num_bad_epochs = 0
+        state.cooldown_counter = scheduler_cfg.cooldown
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
+            print(f"[LR Scheduler] Reduced max lr for optimizer {idx} to {new_lr:.5e}")
+
+
+def cosine_schedule_with_warmup_lr_lambda(
+    current_step: int,
+    *,
+    base_lr: float,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_ratio: float = 0.0,
+    num_cycles: float = 0.5,
+):
+    if num_warmup_steps > 0 and current_step < num_warmup_steps:
         return base_lr * float(current_step) / float(max(1, num_warmup_steps))
 
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
+    adjusted_total = max(num_training_steps, num_warmup_steps + 1)
+    progress = float(current_step - num_warmup_steps) / float(max(1, adjusted_total - num_warmup_steps))
+    return base_lr * (
+        min_ratio
+        + max(
+            0.0,
+            (1 - min_ratio)
+            * 0.5
+            * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
+        )
+    )
+
+
+def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+    return cosine_schedule_with_warmup_lr_lambda(
+        current_step=train_state.stage_step,
+        base_lr=base_lr,
+        num_warmup_steps=max(0, config.lr_warmup_steps),
+        num_training_steps=max(train_state.stage_max_steps, config.lr_warmup_steps + 1),
+        min_ratio=config.lr_min_ratio,
+        num_cycles=config.lr_num_cycles,
+    )
+
+
+def _estimate_stage_max_steps(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int) -> int:
+    steps_per_epoch = math.ceil(
+        (train_metadata.total_groups * train_metadata.mean_puzzle_examples) / max(1, config.global_batch_size)
+    )
+    steps_per_epoch = max(1, steps_per_epoch)
+    epochs_per_iter = max(1, epochs_per_iter)
+    return max(1, steps_per_epoch * epochs_per_iter)
+
+
+def reset_stage_scheduler(
+    train_state: TrainState, config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int
+):
+    train_state.stage_step = 0
+    train_state.stage_max_steps = _estimate_stage_max_steps(config, train_metadata, epochs_per_iter)
 
 
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
@@ -364,16 +497,18 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    lr_schedulers = create_lr_schedulers(config, optimizers)
 
     return TrainState(
         step=0,
         total_steps=total_steps,
+        lr_schedulers=lr_schedulers,
         stage_step=0,
         stage_max_steps=max(1, total_steps),
 
         model=model,
         optimizers=optimizers,
-        optimizer_lrs=optimizer_lrs,
+        optimizer_lrs=list(optimizer_lrs),
         carry=None
     )
 
@@ -406,35 +541,6 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
                 )
         model.load_state_dict(state_dict, assign=True)
-
-
-def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-    return cosine_schedule_with_warmup_lr_lambda(
-        current_step=train_state.stage_step,
-        base_lr=base_lr,
-        num_warmup_steps=round(config.lr_warmup_steps),
-        num_training_steps=max(1, train_state.stage_max_steps),
-        min_ratio=config.lr_min_ratio,
-        num_cycles=config.lr_num_cycles,
-    )
-
-
-def _estimate_stage_max_steps(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int) -> int:
-    steps_per_epoch = math.ceil(
-        (train_metadata.total_groups * train_metadata.mean_puzzle_examples) / max(1, config.global_batch_size)
-    )
-    steps_per_epoch = max(1, steps_per_epoch)
-    epochs_per_iter = max(1, epochs_per_iter)
-    return max(1, steps_per_epoch * epochs_per_iter)
-
-
-def reset_stage_scheduler(
-    train_state: TrainState, config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, epochs_per_iter: int
-):
-    train_state.stage_step = 0
-    train_state.stage_max_steps = _estimate_stage_max_steps(config, train_metadata, epochs_per_iter)
-
-
 
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
     data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
@@ -503,13 +609,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 dist.all_reduce(param.grad)
             
     # Apply optimizer
-    lr_this_step = None    
+    last_lr = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
+        last_lr = lr_this_step
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
+
         optim.step()
         optim.zero_grad()
 
@@ -531,7 +638,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
-            reduced_metrics["train/lr"] = lr_this_step
+            if last_lr is not None:
+                reduced_metrics["train/lr"] = last_lr
             return reduced_metrics
 
 def evaluate(
@@ -793,8 +901,7 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
-    if dataset_manager.enabled():
-        reset_stage_scheduler(train_state, config, train_metadata, train_epochs_per_iter)
+    reset_stage_scheduler(train_state, config, train_metadata, train_epochs_per_iter)
 
     # Progress bar and logger
     progress_bar = None
@@ -842,6 +949,7 @@ def launch(hydra_config: DictConfig):
             print("TRAIN")
         train_state.model.train()
         train_metrics = None
+        eval_metrics_result = None
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
             train_metrics = metrics
@@ -867,7 +975,7 @@ def launch(hydra_config: DictConfig):
             else:
                 train_state_eval = train_state
             train_state_eval.model.eval()
-            metrics = evaluate(config, 
+            eval_metrics_result = evaluate(config, 
                 train_state_eval, 
                 eval_loader, 
                 eval_metadata, 
@@ -876,8 +984,8 @@ def launch(hydra_config: DictConfig):
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP)
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+            if RANK == 0 and eval_metrics_result is not None:
+                wandb.log(eval_metrics_result, step=train_state.step)
                 
             ############ Checkpointing
             if RANK == 0:
@@ -890,11 +998,11 @@ def launch(hydra_config: DictConfig):
                 dataset_manager.enabled()
                 and metric_driven_stage
                 and RANK == 0
-                and metrics is not None
+                and eval_metrics_result is not None
                 and config.stage_advance_metric is not None
                 and config.stage_advance_threshold is not None
             ):
-                metric_value = get_nested_metric(metrics, config.stage_advance_metric)
+                metric_value = get_nested_metric(eval_metrics_result, config.stage_advance_metric)
                 if metric_value is None:
                     metric_value = get_nested_metric(train_metrics, config.stage_advance_metric)
                 if metric_value is not None:
@@ -907,7 +1015,7 @@ def launch(hydra_config: DictConfig):
                     else:
                         raise ValueError(f"Unsupported stage_advance_comparison: {comparison}")
                 else:
-                    raise ValueError(f"Metric value for {config.stage_advance_metric} is None. Eval metrics: {metrics}, train_metrics: {train_metrics}")
+                    raise ValueError(f"Metric value for {config.stage_advance_metric} is None. Eval metrics: {eval_metrics_result}, train_metrics: {train_metrics}")
 
             if (
                 dataset_manager.enabled()
@@ -943,6 +1051,8 @@ def launch(hydra_config: DictConfig):
 
             if config.ema:
                 del train_state_eval
+
+        step_lr_schedulers(config, train_state, eval_metrics_result, train_metrics)
 
     # finalize
     if dist.is_initialized():
